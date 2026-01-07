@@ -4,3 +4,5 @@ openpyxl
 plotly
 numpy
 altair
+streamlit-plotly-events
+requests
