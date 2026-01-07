@@ -2,11 +2,13 @@
 # Sustrend — Modelo Financiero 2026 (Streamlit)
 # Dashboard dinámico recalculado desde inputs del Excel
 # + Cross-filter por click (Plotly events)
-# + Default Excel desde GitHub (raw) + upload opcional
+# + Default Excel desde Repo local o GitHub (raw) + upload opcional
 # + Parsing robusto de escenarios/probabilidades
+# + Safe render por pestaña (evita tabs “en blanco” cuando hay excepciones)
 
 from __future__ import annotations
 
+import os
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Any
@@ -30,9 +32,15 @@ except Exception:
 # CONFIG
 # =========================================================
 
-# 👉 Reemplaza por tu RAW URL real en GitHub
-DEFAULT_XLSX_URL = "https://raw.githubusercontent.com/felipecornejot/Finanzas-Sustrend/main/Sustrend_Modelo_Financiero_2026_v4_dashboard_graficos.xlsx
-"
+# ✅ Recomendado: si el Excel está commiteado en el repo (mismo nivel que app.py),
+# Streamlit Cloud lo lee directo del filesystem (cero problemas de raw URL).
+DEFAULT_LOCAL_XLSX_PATH = "Sustrend_Modelo_Financiero_2026_v4_dashboard_graficos.xlsx"
+
+# ✅ Fallback: RAW URL (si quieres descargar explícitamente desde GitHub)
+DEFAULT_XLSX_URL = (
+    "https://raw.githubusercontent.com/felipecornejot/Finanzas-Sustrend/main/"
+    "Sustrend_Modelo_Financiero_2026_v4_dashboard_graficos.xlsx"
+)
 
 DEFAULT_EXCHANGE_RATE = 950.0  # CLP por 1 USD (ajustable en sidebar)
 
@@ -48,6 +56,11 @@ CSS = """
 header[data-testid="stHeader"] { background: rgba(0,0,0,0); }
 div[data-testid="stMetric"] { padding: 0.2rem 0.6rem; border-radius: 0.75rem; }
 div[data-testid="stDataFrame"] * { font-size: 0.92rem; }
+
+/* inputs: mejora contraste */
+div[data-baseweb="select"] * { color: #111 !important; }
+div[data-baseweb="input"] input { color: #111 !important; }
+div[data-baseweb="input"] input::placeholder { color: rgba(0,0,0,0.5) !important; }
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -77,6 +90,19 @@ def clear_click_filters():
     st.session_state.clicked_client = None
     st.session_state.clicked_project_label = None
     st.session_state.clicked_month = None
+
+
+# =========================================================
+# SAFE RENDER (evita pestañas en blanco)
+# =========================================================
+
+def safe_render(section_name: str, fn):
+    try:
+        fn()
+    except Exception as e:
+        st.error(f"Error en sección: {section_name}")
+        st.exception(e)  # muestra el stacktrace real (no “tab en blanco”)
+        st.stop()
 
 
 # =========================================================
@@ -157,32 +183,23 @@ def to_float_safe(x: Any, default: float = np.nan) -> float:
         return float(x)
 
     s = str(x).strip()
-    if s == "" or s in {"-", "—", "–", "NA", "N/A", "nan", "NaN"}:
+    if s == "" or s in {"-", "—", "–", "NA", "N/A", "nan", "NaN", "None"}:
         return default
 
-    # porcentaje
     is_pct = False
     if "%" in s:
         is_pct = True
         s = s.replace("%", "").strip()
 
-    # normaliza separadores (manejo CL: miles "." y decimal ",")
-    # casos:
-    # - "1.234,56" => "1234.56"
-    # - "1234,56"  => "1234.56"
-    # - "1,234.56" => probablemente US, pero lo manejamos: si hay ambos, asumimos decimal es el último
+    # normaliza separadores
     if "," in s and "." in s:
-        # decide por el último separador como decimal
         if s.rfind(",") > s.rfind("."):
-            # CL-like
             s = s.replace(".", "")
             s = s.replace(",", ".")
         else:
-            # US-like
             s = s.replace(",", "")
     elif "," in s and "." not in s:
         s = s.replace(",", ".")
-    # si solo "." está ok
 
     try:
         v = float(s)
@@ -211,23 +228,94 @@ def melt_month_matrix(df: pd.DataFrame, id_cols: List[str], value_name: str = "M
     keep_cols = [c for c in id_cols if c in df.columns] + month_cols
     tmp = df[keep_cols].copy()
 
-    melted = tmp.melt(id_vars=[c for c in id_cols if c in tmp.columns], var_name="Mes_fin_raw", value_name=value_name)
+    melted = tmp.melt(
+        id_vars=[c for c in id_cols if c in tmp.columns],
+        var_name="Mes_fin_raw",
+        value_name=value_name,
+    )
     melted["Mes_fin"] = melted["Mes_fin_raw"].apply(ensure_month_end)
     melted.drop(columns=["Mes_fin_raw"], inplace=True)
     return melted
 
 
 # =========================================================
-# FILE SOURCE (GitHub default + upload)
+# FILE SOURCE (Repo local + GitHub raw + upload)
 # =========================================================
+
+def is_valid_github_raw_url(url: str) -> bool:
+    if not url:
+        return False
+    u = url.strip()
+    if u.startswith("https://raw.githubusercontent.com/"):
+        return True
+    if u.startswith("https://github.com/") and ("/blob/" in u) and ("raw=1" in u):
+        return True
+    return False
+
 
 @st.cache_data(show_spinner=False)
 def fetch_default_excel_bytes(url: str) -> bytes:
-    if not url or "raw.githubusercontent.com" not in url:
+    if not is_valid_github_raw_url(url):
         raise ValueError("DEFAULT_XLSX_URL no es una raw URL válida de GitHub.")
-    r = requests.get(url, timeout=60)
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, headers=headers, timeout=60)
     r.raise_for_status()
     return r.content
+
+
+@st.cache_data(show_spinner=False)
+def read_local_excel_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def get_excel_bytes_from_sidebar() -> bytes:
+    with st.sidebar:
+        st.subheader("Fuente de datos (Excel)")
+        source = st.radio(
+            "Selecciona fuente",
+            options=[
+                "Usar Excel por defecto (Repo local)",
+                "Usar Excel por defecto (GitHub raw)",
+                "Subir Excel (override)",
+            ],
+            index=0,
+        )
+
+        if source == "Usar Excel por defecto (Repo local)":
+            if not os.path.exists(DEFAULT_LOCAL_XLSX_PATH):
+                st.error(
+                    f"No encuentro el archivo local: {DEFAULT_LOCAL_XLSX_PATH}\n\n"
+                    "Solución: commitea el Excel en la raíz del repo (mismo nivel que app.py), "
+                    "o usa GitHub raw / upload."
+                )
+                st.stop()
+            try:
+                excel_bytes = read_local_excel_bytes(DEFAULT_LOCAL_XLSX_PATH)
+                st.caption("✅ Excel cargado desde el repo (filesystem).")
+                return excel_bytes
+            except Exception as e:
+                st.exception(e)
+                st.stop()
+
+        if source == "Usar Excel por defecto (GitHub raw)":
+            try:
+                with st.spinner("Descargando Excel por defecto desde GitHub (raw)..."):
+                    excel_bytes = fetch_default_excel_bytes(DEFAULT_XLSX_URL)
+                st.caption("✅ Excel cargado desde GitHub (raw).")
+                return excel_bytes
+            except Exception as e:
+                st.error("No pude descargar el Excel por defecto. Revisa DEFAULT_XLSX_URL.")
+                st.exception(e)
+                st.stop()
+
+        # Upload
+        uploaded = st.file_uploader("Sube el Excel (.xlsx)", type=["xlsx"])
+        if uploaded is None:
+            st.info("Sube un archivo para continuar.")
+            st.stop()
+        st.caption("✅ Excel cargado por upload.")
+        return uploaded.getvalue()
 
 
 @st.cache_data(show_spinner=False)
@@ -263,24 +351,24 @@ def parse_params(excel_bytes: bytes) -> Params:
 
 
 def _find_row_index(raw: pd.DataFrame, needle: str) -> Optional[int]:
-    """
-    Busca needle en la primera columna (robusto: acentos/espacios/case)
-    """
     col0 = raw.iloc[:, 0].astype(str).fillna("").map(lambda s: s.strip().lower())
     n = needle.strip().lower()
-    # tolera "parametro" vs "parámetro"
     n2 = n.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
-    for i, v in enumerate(col0.tolist()):
+    vals = col0.tolist()
+    for pos, v in enumerate(vals):
         vv = v.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
         if vv == n2:
-            return raw.index[i]
+            # raw.index[pos] puede ser label, pero es correcto para .loc[]
+            return raw.index[pos]
     return None
 
 
 def parse_scenarios(excel_bytes: bytes) -> Dict[str, Scenario]:
     raw = read_sheet(excel_bytes, "02B_ESCENARIOS", header=None)
 
-    a0 = _find_row_index(raw, "Parámetro") or _find_row_index(raw, "Parametro")
+    a0 = _find_row_index(raw, "Parámetro")
+    if a0 is None:
+        a0 = _find_row_index(raw, "Parametro")
     if a0 is None:
         raise ValueError("No se encontró la tabla de parámetros (fila 'Parámetro') en 02B_ESCENARIOS.")
 
@@ -295,8 +383,8 @@ def parse_scenarios(excel_bytes: bytes) -> Dict[str, Scenario]:
     a = a.dropna(subset=["Parametro"]).copy()
     a["Parametro"] = a["Parametro"].astype(str).str.strip()
 
-    # recorta antes de que empiece la tabla Estado (si aparece más abajo)
-    if b0 > a0:
+    # recorta antes de tabla Estado (si aparece más abajo)
+    if b0 is not None and b0 > a0:
         a = a.loc[: b0 - 1].copy()
 
     # ---- Tabla B: probabilidades por estado ----
@@ -312,7 +400,6 @@ def parse_scenarios(excel_bytes: bytes) -> Dict[str, Scenario]:
         v = s.iloc[0]
         if pd.isna(v):
             return default
-        # admite coma/% etc
         vv = to_float_safe(v, default=np.nan)
         if np.isnan(vv):
             return default
@@ -326,21 +413,23 @@ def parse_scenarios(excel_bytes: bytes) -> Dict[str, Scenario]:
                 continue
             v = to_float_safe(r.get(scen), default=np.nan)
 
-            # Si viene vacío o no parseable: asumimos 0 (no 1) para no inflar
+            # si viene vacío o no parseable: 0 para no inflar
             if np.isnan(v):
                 v = 0.0
-            # clamp
+
+            # clamp [0,1]
             v = max(0.0, min(1.0, float(v)))
             out[estado] = v
 
-        # Normaliza si no suma ~1 (y si suma > 0)
-        s = sum(out.values())
-        if s > 0 and not (0.98 <= s <= 1.02):
-            out = {k: v / s for k, v in out.items()}
-        # Si todo era 0, fallback seguro: todo 1 para evitar dividir por cero,
-        # pero solo si hay estados. (equivale a “no aplico prob.”)
-        if (sum(out.values()) == 0) and len(out) > 0:
+        # normaliza si suma >0 y no está ~1
+        ssum = sum(out.values())
+        if ssum > 0 and not (0.98 <= ssum <= 1.02):
+            out = {k: v / ssum for k, v in out.items()}
+
+        # si todo quedó 0, fallback uniforme (no se usa para ponderar)
+        if len(out) > 0 and sum(out.values()) == 0:
             out = {k: 1.0 for k in out.keys()}
+
         return out
 
     scenarios: Dict[str, Scenario] = {}
@@ -837,9 +926,12 @@ def build_kpis(pyg: pd.DataFrame, cash: pd.DataFrame, fact_rev: pd.DataFrame) ->
 
     neg = cash.loc[cash["Flujo_neto"] < 0, "Flujo_neto"]
     burn_prom = float(-neg.mean()) if len(neg) else 0.0
-    runway = float("inf") if burn_prom <= 0 else max(0.0, cash_fin := cash["Caja_fin_mes"].iloc[-1]) / burn_prom
+    runway = float("inf") if burn_prom <= 0 else max(0.0, caja_fin) / burn_prom
 
-    by_cli = fact_rev.groupby("Cliente", as_index=False)["Monto_neto_hito"].sum().sort_values("Monto_neto_hito", ascending=False)
+    by_cli = (
+        fact_rev.groupby("Cliente", as_index=False)["Monto_neto_hito"].sum()
+        .sort_values("Monto_neto_hito", ascending=False)
+    )
     top3 = float(by_cli.head(3)["Monto_neto_hito"].sum())
     conc_top3 = (top3 / ventas) if ventas > 0 else np.nan
 
@@ -865,6 +957,8 @@ def build_kpis(pyg: pd.DataFrame, cash: pd.DataFrame, fact_rev: pd.DataFrame) ->
 def compute_model(excel_bytes: bytes, scenario_name: str) -> Dict[str, pd.DataFrame]:
     params = parse_params(excel_bytes)
     scenarios = parse_scenarios(excel_bytes)
+    if scenario_name not in scenarios:
+        raise ValueError(f"Escenario '{scenario_name}' no existe. Opciones: {list(scenarios.keys())}")
     scenario = scenarios[scenario_name]
 
     inputs = load_inputs(excel_bytes)
@@ -945,40 +1039,18 @@ def to_currency(df: pd.DataFrame, cols: List[str], mode: str, fx: float) -> pd.D
 
 st.title("📊 Sustrend — Modelo Financiero 2026 (dinámico)")
 
+# ---- Excel bytes (robusto) ----
+excel_bytes = get_excel_bytes_from_sidebar()
+
 with st.sidebar:
-    st.subheader("Fuente de datos (Excel)")
-    source = st.radio(
-        "Selecciona fuente",
-        options=["Usar Excel por defecto (GitHub)", "Subir Excel (override)"],
-        index=0,
-    )
-
-    uploaded = None
-    excel_bytes: Optional[bytes] = None
-
-    if source == "Subir Excel (override)":
-        uploaded = st.file_uploader("Sube el Excel (.xlsx)", type=["xlsx"])
-        if uploaded is None:
-            st.info("Sube un archivo para continuar (o cambia a GitHub).")
-            st.stop()
-        excel_bytes = uploaded.getvalue()
-    else:
-        # GitHub default
-        try:
-            with st.spinner("Descargando Excel por defecto desde GitHub..."):
-                excel_bytes = fetch_default_excel_bytes(DEFAULT_XLSX_URL)
-            st.caption("✅ Excel cargado desde GitHub (raw).")
-        except Exception as e:
-            st.error(f"No pude descargar el Excel por defecto. Revisa DEFAULT_XLSX_URL.\n\nDetalle: {e}")
-            st.stop()
-
     st.divider()
     st.subheader("Escenario")
     try:
         scenarios = parse_scenarios(excel_bytes)
         scen = st.selectbox("Escenario", options=list(scenarios.keys()), index=0)
     except Exception as e:
-        st.error(f"Error leyendo escenarios (02B_ESCENARIOS): {e}")
+        st.error("Error leyendo escenarios (02B_ESCENARIOS).")
+        st.exception(e)
         st.stop()
 
     st.subheader("Conversión (opcional)")
@@ -1128,226 +1200,243 @@ tab_resumen, tab_ingresos, tab_costos, tab_caja_iva, tab_escenarios = st.tabs(
 
 # ---- Resumen ----
 with tab_resumen:
-    left, right = st.columns([1.2, 1.0], gap="large")
+    def render_resumen():
+        left, right = st.columns([1.2, 1.0], gap="large")
 
-    with left:
-        st.subheader("Caja acumulada (click en un mes para filtrar)")
-        fig = px.line(cash_disp, x="Mes_fin", y="Caja_fin_mes", markers=True, title="Caja fin de mes")
-        fig.update_layout(height=380, xaxis_title="", yaxis_title=("USD" if currency == "USD" else "CLP"))
+        with left:
+            st.subheader("Caja acumulada (click en un mes para filtrar)")
+            fig = px.line(cash_disp, x="Mes_fin", y="Caja_fin_mes", markers=True, title="Caja fin de mes")
+            fig.update_layout(height=380, xaxis_title="", yaxis_title=("USD" if currency == "USD" else "CLP"))
 
-        if HAS_PLOTLY_EVENTS and st.session_state.click_filters_on:
-            ev = plotly_events(fig, click_event=True, hover_event=False, select_event=False, key="evt_cash_month")
-            if ev:
-                x = ev[0].get("x")
-                m = ensure_month_end(x)
-                st.session_state.clicked_month = m
-                st.rerun()
-        else:
-            st.plotly_chart(fig, use_container_width=True)
+            if HAS_PLOTLY_EVENTS and st.session_state.click_filters_on:
+                ev = plotly_events(fig, click_event=True, hover_event=False, select_event=False, key="evt_cash_month")
+                if ev:
+                    x = ev[0].get("x")
+                    m = ensure_month_end(x)
+                    st.session_state.clicked_month = m
+                    st.rerun()
+            else:
+                st.plotly_chart(fig, use_container_width=True)
 
-        st.subheader("Waterfall: Ventas → Margen → EBITDA")
-        total_ventas = float(pyg_disp["Ventas_netas"].sum())
-        total_cd = float(pyg_disp["Costos_directos"].sum())
-        total_opex = float(pyg_disp["OPEX"].sum())
-        total_ppl = float(pyg_disp["Personas"].sum())
+            st.subheader("Waterfall: Ventas → Margen → EBITDA")
+            total_ventas = float(pyg_disp["Ventas_netas"].sum())
+            total_cd = float(pyg_disp["Costos_directos"].sum())
+            total_opex = float(pyg_disp["OPEX"].sum())
+            total_ppl = float(pyg_disp["Personas"].sum())
 
-        wf = go.Figure(
-            go.Waterfall(
-                orientation="v",
-                measure=["relative", "relative", "relative", "relative", "total"],
-                x=["Ventas netas", "- Costos directos", "- OPEX", "- Personas", "EBITDA"],
-                y=[total_ventas, -total_cd, -total_opex, -total_ppl, 0],
+            wf = go.Figure(
+                go.Waterfall(
+                    orientation="v",
+                    measure=["relative", "relative", "relative", "relative", "total"],
+                    x=["Ventas netas", "- Costos directos", "- OPEX", "- Personas", "EBITDA"],
+                    y=[total_ventas, -total_cd, -total_opex, -total_ppl, 0],
+                )
             )
-        )
-        wf.update_layout(height=380, title="Descomposición EBITDA", yaxis_title=("USD" if currency == "USD" else "CLP"))
-        st.plotly_chart(wf, use_container_width=True)
+            wf.update_layout(height=380, title="Descomposición EBITDA", yaxis_title=("USD" if currency == "USD" else "CLP"))
+            st.plotly_chart(wf, use_container_width=True)
 
-    with right:
-        st.subheader("P&L mensual (neto)")
-        fig2 = go.Figure()
-        fig2.add_trace(go.Bar(x=pyg_disp["Mes_fin"], y=pyg_disp["Ventas_netas"], name="Ventas netas"))
-        fig2.add_trace(go.Bar(x=pyg_disp["Mes_fin"], y=pyg_disp["Costos_directos"], name="Costos directos"))
-        fig2.add_trace(go.Bar(x=pyg_disp["Mes_fin"], y=pyg_disp["OPEX"], name="OPEX"))
-        fig2.add_trace(go.Bar(x=pyg_disp["Mes_fin"], y=pyg_disp["Personas"], name="Personas"))
-        fig2.update_layout(barmode="group", height=380, xaxis_title="", yaxis_title=("USD" if currency == "USD" else "CLP"))
-        st.plotly_chart(fig2, use_container_width=True)
+        with right:
+            st.subheader("P&L mensual (neto)")
+            fig2 = go.Figure()
+            fig2.add_trace(go.Bar(x=pyg_disp["Mes_fin"], y=pyg_disp["Ventas_netas"], name="Ventas netas"))
+            fig2.add_trace(go.Bar(x=pyg_disp["Mes_fin"], y=pyg_disp["Costos_directos"], name="Costos directos"))
+            fig2.add_trace(go.Bar(x=pyg_disp["Mes_fin"], y=pyg_disp["OPEX"], name="OPEX"))
+            fig2.add_trace(go.Bar(x=pyg_disp["Mes_fin"], y=pyg_disp["Personas"], name="Personas"))
+            fig2.update_layout(barmode="group", height=380, xaxis_title="", yaxis_title=("USD" if currency == "USD" else "CLP"))
+            st.plotly_chart(fig2, use_container_width=True)
 
-        if not mode_board:
-            st.subheader("Tabla P&L (drill)")
-            st.dataframe(pyg_disp, use_container_width=True, hide_index=True)
+            if not mode_board:
+                st.subheader("Tabla P&L (drill)")
+                st.dataframe(pyg_disp, use_container_width=True, hide_index=True)
+
+    safe_render("Resumen", render_resumen)
 
 
 # ---- Ingresos ----
 with tab_ingresos:
-    st.subheader("Devengo vs Cobro (bruto)")
-    cob_f = build_fact_cobranzas(fact_rev_f, cal)
-    cob_f = cob_f[(cob_f["Mes_fin"] >= dr_start) & (cob_f["Mes_fin"] <= dr_end)].copy()
-    cob_disp = to_currency(cob_f, ["Cobros_brutos"], currency, fx)
+    def render_ingresos():
+        st.subheader("Devengo vs Cobro (bruto)")
+        cob_f = build_fact_cobranzas(fact_rev_f, cal)
+        cob_f = cob_f[(cob_f["Mes_fin"] >= dr_start) & (cob_f["Mes_fin"] <= dr_end)].copy()
+        cob_disp = to_currency(cob_f, ["Cobros_brutos"], currency, fx)
 
-    dev_bruto = fact_rev_f.groupby("Mes_facturacion", as_index=False)["Monto_bruto_hito"].sum().rename(
-        columns={"Mes_facturacion": "Mes_fin", "Monto_bruto_hito": "Devengo_bruto"}
-    )
-    dev_bruto = dev_bruto[(dev_bruto["Mes_fin"] >= dr_start) & (dev_bruto["Mes_fin"] <= dr_end)].copy()
-    dev_disp = to_currency(dev_bruto, ["Devengo_bruto"], currency, fx)
+        dev_bruto = fact_rev_f.groupby("Mes_facturacion", as_index=False)["Monto_bruto_hito"].sum().rename(
+            columns={"Mes_facturacion": "Mes_fin", "Monto_bruto_hito": "Devengo_bruto"}
+        )
+        dev_bruto = dev_bruto[(dev_bruto["Mes_fin"] >= dr_start) & (dev_bruto["Mes_fin"] <= dr_end)].copy()
+        dev_disp = to_currency(dev_bruto, ["Devengo_bruto"], currency, fx)
 
-    t = pd.DataFrame({"Mes_fin": cal["Mes_fin"]})
-    t = t.merge(dev_disp, on="Mes_fin", how="left").merge(cob_disp.rename(columns={"Cobros_brutos": "Cobros"}), on="Mes_fin", how="left")
-    t = t[(t["Mes_fin"] >= dr_start) & (t["Mes_fin"] <= dr_end)].fillna(0.0)
+        t = pd.DataFrame({"Mes_fin": cal["Mes_fin"]})
+        t = t.merge(dev_disp, on="Mes_fin", how="left").merge(
+            cob_disp.rename(columns={"Cobros_brutos": "Cobros"}), on="Mes_fin", how="left"
+        )
+        t = t[(t["Mes_fin"] >= dr_start) & (t["Mes_fin"] <= dr_end)].fillna(0.0)
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=t["Mes_fin"], y=t["Devengo_bruto"], mode="lines+markers", name="Devengo (bruto)"))
-    fig.add_trace(go.Scatter(x=t["Mes_fin"], y=t["Cobros"], mode="lines+markers", name="Cobros (bruto)"))
-    fig.update_layout(height=420, xaxis_title="", yaxis_title=("USD" if currency == "USD" else "CLP"))
-    st.plotly_chart(fig, use_container_width=True)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=t["Mes_fin"], y=t["Devengo_bruto"], mode="lines+markers", name="Devengo (bruto)"))
+        fig.add_trace(go.Scatter(x=t["Mes_fin"], y=t["Cobros"], mode="lines+markers", name="Cobros (bruto)"))
+        fig.update_layout(height=420, xaxis_title="", yaxis_title=("USD" if currency == "USD" else "CLP"))
+        st.plotly_chart(fig, use_container_width=True)
 
-    colA, colB = st.columns(2, gap="large")
+        colA, colB = st.columns(2, gap="large")
 
-    with colA:
-        st.subheader("Mix: ventas netas por Cliente (click para filtrar)")
-        by_cli = fact_rev_f.groupby("Cliente", as_index=False)["Monto_neto_hito"].sum().sort_values("Monto_neto_hito", ascending=False)
-        by_cli_disp = to_currency(by_cli, ["Monto_neto_hito"], currency, fx)
+        with colA:
+            st.subheader("Mix: ventas netas por Cliente (click para filtrar)")
+            by_cli = fact_rev_f.groupby("Cliente", as_index=False)["Monto_neto_hito"].sum().sort_values("Monto_neto_hito", ascending=False)
+            by_cli_disp = to_currency(by_cli, ["Monto_neto_hito"], currency, fx)
 
-        fig_cli = px.bar(by_cli_disp.head(30), x="Cliente", y="Monto_neto_hito", title="Top clientes (neto)")
-        fig_cli.update_layout(height=420, xaxis_title="", yaxis_title=("USD" if currency == "USD" else "CLP"))
+            fig_cli = px.bar(by_cli_disp.head(30), x="Cliente", y="Monto_neto_hito", title="Top clientes (neto)")
+            fig_cli.update_layout(height=420, xaxis_title="", yaxis_title=("USD" if currency == "USD" else "CLP"))
 
-        if HAS_PLOTLY_EVENTS and st.session_state.click_filters_on:
-            ev = plotly_events(fig_cli, click_event=True, hover_event=False, select_event=False, key="evt_client")
-            if ev:
-                clicked = ev[0].get("x")
-                if clicked is not None:
-                    st.session_state.clicked_client = str(clicked)
-                    st.session_state.clicked_project_label = None
-                    st.rerun()
-        else:
-            st.plotly_chart(fig_cli, use_container_width=True)
+            if HAS_PLOTLY_EVENTS and st.session_state.click_filters_on:
+                ev = plotly_events(fig_cli, click_event=True, hover_event=False, select_event=False, key="evt_client")
+                if ev:
+                    clicked = ev[0].get("x")
+                    if clicked is not None:
+                        st.session_state.clicked_client = str(clicked)
+                        st.session_state.clicked_project_label = None
+                        st.rerun()
+            else:
+                st.plotly_chart(fig_cli, use_container_width=True)
 
-    with colB:
-        st.subheader("Mix: ventas netas por Proyecto (click para filtrar)")
-        by_proj = fact_rev_f.groupby(["Proyecto_ID", "Proyecto_nombre"], as_index=False)["Monto_neto_hito"].sum().sort_values("Monto_neto_hito", ascending=False)
-        by_proj["label"] = by_proj["Proyecto_ID"].astype(str) + " — " + by_proj["Proyecto_nombre"].astype(str)
-        by_proj_disp = to_currency(by_proj, ["Monto_neto_hito"], currency, fx)
+        with colB:
+            st.subheader("Mix: ventas netas por Proyecto (click para filtrar)")
+            by_proj = fact_rev_f.groupby(["Proyecto_ID", "Proyecto_nombre"], as_index=False)["Monto_neto_hito"].sum().sort_values("Monto_neto_hito", ascending=False)
+            by_proj["label"] = by_proj["Proyecto_ID"].astype(str) + " — " + by_proj["Proyecto_nombre"].astype(str)
+            by_proj_disp = to_currency(by_proj, ["Monto_neto_hito"], currency, fx)
 
-        fig_pr = px.bar(by_proj_disp.head(30), x="label", y="Monto_neto_hito", title="Top proyectos (neto)")
-        fig_pr.update_layout(height=420, xaxis_title="", yaxis_title=("USD" if currency == "USD" else "CLP"))
-        fig_pr.update_xaxes(tickangle=35)
+            fig_pr = px.bar(by_proj_disp.head(30), x="label", y="Monto_neto_hito", title="Top proyectos (neto)")
+            fig_pr.update_layout(height=420, xaxis_title="", yaxis_title=("USD" if currency == "USD" else "CLP"))
+            fig_pr.update_xaxes(tickangle=35)
 
-        if HAS_PLOTLY_EVENTS and st.session_state.click_filters_on:
-            ev = plotly_events(fig_pr, click_event=True, hover_event=False, select_event=False, key="evt_project")
-            if ev:
-                clicked = ev[0].get("x")
-                if clicked is not None:
-                    st.session_state.clicked_project_label = str(clicked)
-                    st.session_state.clicked_client = None
-                    st.rerun()
-        else:
-            st.plotly_chart(fig_pr, use_container_width=True)
+            if HAS_PLOTLY_EVENTS and st.session_state.click_filters_on:
+                ev = plotly_events(fig_pr, click_event=True, hover_event=False, select_event=False, key="evt_project")
+                if ev:
+                    clicked = ev[0].get("x")
+                    if clicked is not None:
+                        st.session_state.clicked_project_label = str(clicked)
+                        st.session_state.clicked_client = None
+                        st.rerun()
+            else:
+                st.plotly_chart(fig_pr, use_container_width=True)
 
-    if not mode_board:
-        st.subheader("Detalle devengo (hitos)")
-        detail = fact_rev_f.copy()
-        if currency == "USD":
-            for c in ["Monto_neto_hito", "IVA_hito", "Monto_bruto_hito"]:
-                detail[c] = detail[c] / fx
-        st.dataframe(detail.sort_values(["Mes_facturacion", "Cliente"]), use_container_width=True, hide_index=True)
+        if not mode_board:
+            st.subheader("Detalle devengo (hitos)")
+            detail = fact_rev_f.copy()
+            if currency == "USD":
+                for c in ["Monto_neto_hito", "IVA_hito", "Monto_bruto_hito"]:
+                    detail[c] = detail[c] / fx
+            st.dataframe(detail.sort_values(["Mes_facturacion", "Cliente"]), use_container_width=True, hide_index=True)
+
+    safe_render("Ingresos", render_ingresos)
 
 
 # ---- Costos ----
 with tab_costos:
-    st.subheader("Estructura de costos (neto)")
-    cd_m = fact_cd.groupby("Mes_fin", as_index=False)["CD_neto"].sum().rename(columns={"CD_neto": "Costos_directos"})
-    opex_m = fact_opex.groupby("Mes_fin", as_index=False)["OPEX_neto"].sum().rename(columns={"OPEX_neto": "OPEX"})
-    ppl_m = fact_ppl.groupby("Mes_fin", as_index=False)["Total_personas"].sum().rename(columns={"Total_personas": "Personas"})
+    def render_costos():
+        st.subheader("Estructura de costos (neto)")
+        cd_m = fact_cd.groupby("Mes_fin", as_index=False)["CD_neto"].sum().rename(columns={"CD_neto": "Costos_directos"})
+        opex_m = fact_opex.groupby("Mes_fin", as_index=False)["OPEX_neto"].sum().rename(columns={"OPEX_neto": "OPEX"})
+        ppl_m = fact_ppl.groupby("Mes_fin", as_index=False)["Total_personas"].sum().rename(columns={"Total_personas": "Personas"})
 
-    cost = pd.DataFrame({"Mes_fin": cal["Mes_fin"]})
-    cost = cost.merge(cd_m, on="Mes_fin", how="left").merge(opex_m, on="Mes_fin", how="left").merge(ppl_m, on="Mes_fin", how="left")
-    cost = cost[(cost["Mes_fin"] >= dr_start) & (cost["Mes_fin"] <= dr_end)].fillna(0.0)
-    cost_disp = to_currency(cost, ["Costos_directos", "OPEX", "Personas"], currency, fx)
+        cost = pd.DataFrame({"Mes_fin": cal["Mes_fin"]})
+        cost = cost.merge(cd_m, on="Mes_fin", how="left").merge(opex_m, on="Mes_fin", how="left").merge(ppl_m, on="Mes_fin", how="left")
+        cost = cost[(cost["Mes_fin"] >= dr_start) & (cost["Mes_fin"] <= dr_end)].fillna(0.0)
+        cost_disp = to_currency(cost, ["Costos_directos", "OPEX", "Personas"], currency, fx)
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=cost_disp["Mes_fin"], y=cost_disp["Costos_directos"], stackgroup="one", name="Costos directos"))
-    fig.add_trace(go.Scatter(x=cost_disp["Mes_fin"], y=cost_disp["OPEX"], stackgroup="one", name="OPEX"))
-    fig.add_trace(go.Scatter(x=cost_disp["Mes_fin"], y=cost_disp["Personas"], stackgroup="one", name="Personas"))
-    fig.update_layout(height=420, xaxis_title="", yaxis_title=("USD" if currency == "USD" else "CLP"), title="Stack (neto)")
-    st.plotly_chart(fig, use_container_width=True)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=cost_disp["Mes_fin"], y=cost_disp["Costos_directos"], stackgroup="one", name="Costos directos"))
+        fig.add_trace(go.Scatter(x=cost_disp["Mes_fin"], y=cost_disp["OPEX"], stackgroup="one", name="OPEX"))
+        fig.add_trace(go.Scatter(x=cost_disp["Mes_fin"], y=cost_disp["Personas"], stackgroup="one", name="Personas"))
+        fig.update_layout(height=420, xaxis_title="", yaxis_title=("USD" if currency == "USD" else "CLP"), title="Stack (neto)")
+        st.plotly_chart(fig, use_container_width=True)
 
-    if not mode_board:
-        st.subheader("Detalle OPEX (drill)")
-        o_detail = fact_opex[(fact_opex["Mes_fin"] >= dr_start) & (fact_opex["Mes_fin"] <= dr_end)].copy()
-        if currency == "USD":
-            for c in ["OPEX_neto", "IVA_credito_opex", "OPEX_bruto"]:
-                o_detail[c] = o_detail[c] / fx
-        st.dataframe(o_detail.sort_values(["Mes_fin", "Tipo_gasto", "Concepto"]), use_container_width=True, hide_index=True)
+        if not mode_board:
+            st.subheader("Detalle OPEX (drill)")
+            o_detail = fact_opex[(fact_opex["Mes_fin"] >= dr_start) & (fact_opex["Mes_fin"] <= dr_end)].copy()
+            if currency == "USD":
+                for c in ["OPEX_neto", "IVA_credito_opex", "OPEX_bruto"]:
+                    o_detail[c] = o_detail[c] / fx
+            st.dataframe(o_detail.sort_values(["Mes_fin", "Tipo_gasto", "Concepto"]), use_container_width=True, hide_index=True)
+
+    safe_render("Costos", render_costos)
 
 
 # ---- Caja + IVA ----
 with tab_caja_iva:
-    st.subheader("Flujo de caja mensual (componentes)")
-    comp = cash_disp.copy()
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=comp["Mes_fin"], y=comp["Cobros"], name="Cobros"))
-    fig.add_trace(go.Bar(x=comp["Mes_fin"], y=comp["NoOp_Neto"], name="No Operacionales"))
-    fig.add_trace(go.Bar(x=comp["Mes_fin"], y=-comp["Pagos_OPEX"], name="- OPEX"))
-    fig.add_trace(go.Bar(x=comp["Mes_fin"], y=-comp["Pagos_CD"], name="- Costos directos"))
-    fig.add_trace(go.Bar(x=comp["Mes_fin"], y=-comp["Pagos_Personas"], name="- Personas"))
-    fig.add_trace(go.Bar(x=comp["Mes_fin"], y=-comp["Pago_IVA"], name="- IVA pagado"))
-    fig.update_layout(barmode="relative", height=420, xaxis_title="", yaxis_title=("USD" if currency == "USD" else "CLP"))
-    st.plotly_chart(fig, use_container_width=True)
+    def render_caja_iva():
+        st.subheader("Flujo de caja mensual (componentes)")
+        comp = cash_disp.copy()
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=comp["Mes_fin"], y=comp["Cobros"], name="Cobros"))
+        fig.add_trace(go.Bar(x=comp["Mes_fin"], y=comp["NoOp_Neto"], name="No Operacionales"))
+        fig.add_trace(go.Bar(x=comp["Mes_fin"], y=-comp["Pagos_OPEX"], name="- OPEX"))
+        fig.add_trace(go.Bar(x=comp["Mes_fin"], y=-comp["Pagos_CD"], name="- Costos directos"))
+        fig.add_trace(go.Bar(x=comp["Mes_fin"], y=-comp["Pagos_Personas"], name="- Personas"))
+        fig.add_trace(go.Bar(x=comp["Mes_fin"], y=-comp["Pago_IVA"], name="- IVA pagado"))
+        fig.update_layout(barmode="relative", height=420, xaxis_title="", yaxis_title=("USD" if currency == "USD" else "CLP"))
+        st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("IVA (débito, crédito, neto y pago mes siguiente)")
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=iva_disp["Mes_fin"], y=iva_disp["IVA_debito"], mode="lines+markers", name="IVA débito"))
-    fig2.add_trace(go.Scatter(x=iva_disp["Mes_fin"], y=iva_disp["IVA_credito"], mode="lines+markers", name="IVA crédito"))
-    fig2.add_trace(go.Scatter(x=iva_disp["Mes_fin"], y=iva_disp["IVA_neto_mes"], mode="lines+markers", name="IVA neto mes"))
-    fig2.add_trace(go.Scatter(x=iva_disp["Mes_fin"], y=iva_disp["IVA_pago_mes_siguiente"], mode="lines+markers", name="Pago IVA (mes siguiente)"))
-    fig2.update_layout(height=420, xaxis_title="", yaxis_title=("USD" if currency == "USD" else "CLP"))
-    st.plotly_chart(fig2, use_container_width=True)
+        st.subheader("IVA (débito, crédito, neto y pago mes siguiente)")
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=iva_disp["Mes_fin"], y=iva_disp["IVA_debito"], mode="lines+markers", name="IVA débito"))
+        fig2.add_trace(go.Scatter(x=iva_disp["Mes_fin"], y=iva_disp["IVA_credito"], mode="lines+markers", name="IVA crédito"))
+        fig2.add_trace(go.Scatter(x=iva_disp["Mes_fin"], y=iva_disp["IVA_neto_mes"], mode="lines+markers", name="IVA neto mes"))
+        fig2.add_trace(go.Scatter(x=iva_disp["Mes_fin"], y=iva_disp["IVA_pago_mes_siguiente"], mode="lines+markers", name="Pago IVA (mes siguiente)"))
+        fig2.update_layout(height=420, xaxis_title="", yaxis_title=("USD" if currency == "USD" else "CLP"))
+        st.plotly_chart(fig2, use_container_width=True)
 
-    if not mode_board:
-        st.subheader("Tabla caja (drill)")
-        st.dataframe(cash_disp, use_container_width=True, hide_index=True)
-        st.subheader("Tabla IVA (drill)")
-        st.dataframe(iva_disp, use_container_width=True, hide_index=True)
+        if not mode_board:
+            st.subheader("Tabla caja (drill)")
+            st.dataframe(cash_disp, use_container_width=True, hide_index=True)
+            st.subheader("Tabla IVA (drill)")
+            st.dataframe(iva_disp, use_container_width=True, hide_index=True)
+
+    safe_render("Caja + IVA", render_caja_iva)
 
 
 # ---- Escenarios ----
 with tab_escenarios:
-    st.subheader("Comparador de escenarios (recalcula todo)")
-    scen_names = list(scenarios.keys())
-    results = []
-    cash_lines = []
+    def render_escenarios():
+        st.subheader("Comparador de escenarios (recalcula todo)")
+        scen_names = list(scenarios.keys())
+        results = []
+        cash_lines = []
 
-    for s in scen_names:
-        m = compute_model(excel_bytes, s)
-        pyg_s = m["pyg"][(m["pyg"]["Mes_fin"] >= dr_start) & (m["pyg"]["Mes_fin"] <= dr_end)].copy()
-        cash_s = m["cash"][(m["cash"]["Mes_fin"] >= dr_start) & (m["cash"]["Mes_fin"] <= dr_end)].copy()
-        rev_s = m["fact_rev"][(m["fact_rev"]["Mes_facturacion"] >= dr_start) & (m["fact_rev"]["Mes_facturacion"] <= dr_end)].copy()
+        for s in scen_names:
+            m = compute_model(excel_bytes, s)
+            pyg_s = m["pyg"][(m["pyg"]["Mes_fin"] >= dr_start) & (m["pyg"]["Mes_fin"] <= dr_end)].copy()
+            cash_s = m["cash"][(m["cash"]["Mes_fin"] >= dr_start) & (m["cash"]["Mes_fin"] <= dr_end)].copy()
+            rev_s = m["fact_rev"][(m["fact_rev"]["Mes_facturacion"] >= dr_start) & (m["fact_rev"]["Mes_facturacion"] <= dr_end)].copy()
 
-        k = build_kpis(pyg_s, cash_s, rev_s)
-        k["Escenario"] = s
-        results.append(k)
+            k = build_kpis(pyg_s, cash_s, rev_s)
+            k["Escenario"] = s
+            results.append(k)
 
-        line = cash_s[["Mes_fin", "Caja_fin_mes"]].copy()
-        line["Escenario"] = s
-        cash_lines.append(line)
+            line = cash_s[["Mes_fin", "Caja_fin_mes"]].copy()
+            line["Escenario"] = s
+            cash_lines.append(line)
 
-    kdf = pd.DataFrame(results)
-    if currency == "USD":
-        for c in ["Ventas_netas", "Margen_bruto", "EBITDA", "Caja_min", "Caja_fin", "Burn_prom"]:
-            kdf[c] = kdf[c] / fx
+        kdf = pd.DataFrame(results)
+        if currency == "USD":
+            for c in ["Ventas_netas", "Margen_bruto", "EBITDA", "Caja_min", "Caja_fin", "Burn_prom"]:
+                kdf[c] = kdf[c] / fx
 
-    st.dataframe(
-        kdf[["Escenario", "Ventas_netas", "Margen_bruto", "EBITDA", "Caja_min", "Caja_fin", "Conc_top3", "Runway_meses_aprox"]],
-        use_container_width=True,
-        hide_index=True
-    )
+        st.dataframe(
+            kdf[["Escenario", "Ventas_netas", "Margen_bruto", "EBITDA", "Caja_min", "Caja_fin", "Conc_top3", "Runway_meses_aprox"]],
+            use_container_width=True,
+            hide_index=True
+        )
 
-    lines = pd.concat(cash_lines, ignore_index=True)
-    if currency == "USD":
-        lines["Caja_fin_mes"] = lines["Caja_fin_mes"] / fx
+        lines = pd.concat(cash_lines, ignore_index=True)
+        if currency == "USD":
+            lines["Caja_fin_mes"] = lines["Caja_fin_mes"] / fx
 
-    fig = px.line(lines, x="Mes_fin", y="Caja_fin_mes", color="Escenario", markers=True, title="Caja fin de mes por escenario")
-    fig.update_layout(height=450, xaxis_title="", yaxis_title=("USD" if currency == "USD" else "CLP"))
-    st.plotly_chart(fig, use_container_width=True)
+        fig = px.line(lines, x="Mes_fin", y="Caja_fin_mes", color="Escenario", markers=True, title="Caja fin de mes por escenario")
+        fig.update_layout(height=450, xaxis_title="", yaxis_title=("USD" if currency == "USD" else "CLP"))
+        st.plotly_chart(fig, use_container_width=True)
+
+    safe_render("Escenarios", render_escenarios)
 
 st.divider()
 st.caption("Tip: click-to-filter funciona mejor con 1 clic; para volver, usa 'Limpiar filtros click' o 'Limpiar todo'.")
