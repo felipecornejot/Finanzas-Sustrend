@@ -31,7 +31,7 @@ except Exception:
 # =========================================================
 
 # 👉 Reemplaza por tu RAW URL real en GitHub
-DEFAULT_XLSX_URL = "https://github.com/felipecornejot/Finanzas-Sustrend/blob/main/Sustrend_Modelo_Financiero_2026_v4_dashboard_graficos.xlsx"
+DEFAULT_XLSX_URL = "Sustrend_Modelo_Financiero_2026_v4_dashboard_graficos.xlsx"
 
 DEFAULT_EXCHANGE_RATE = 950.0  # CLP por 1 USD (ajustable en sidebar)
 
